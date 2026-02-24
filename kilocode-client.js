@@ -1,17 +1,17 @@
 /**
  * Kilo Code API Client
- * Handles communication with the Kilo Code API for AI-powered code generation
+ * Handles communication with the Kilo Code Agent API for AI-powered code generation
  */
 
 const API_BASE_URL = 'https://api.kilocode.io/v1';
 
 /**
- * Send a prompt to the Kilo Code API and receive the response
- * @param {string} prompt - The prompt to send to the API
- * @param {object} options - Additional options for the API call
- * @returns {Promise<object>} - The API response
+ * Execute an agent task with Kilo Code API
+ * @param {string} message - The prompt/instruction for the agent
+ * @param {object} options - Additional options for the agent
+ * @returns {Promise<object>} - The agent execution result
  */
-async function sendPrompt(prompt, options = {}) {
+async function executeAgent(message, options = {}) {
   const apiKey = process.env.KILOCODE_API_KEY;
   
   if (!apiKey) {
@@ -19,34 +19,25 @@ async function sendPrompt(prompt, options = {}) {
   }
 
   const defaultOptions = {
-    model: 'claude-3-haiku', // Fast, smaller model for rapid generation
-    max_tokens: 4000,
-    temperature: 0.7,
+    mode: options.mode || 'code',
+    tools: options.tools || ['read_file', 'write_to_file', 'execute_command', 'list_files'],
+    workspace: options.workspace || '/workspace',
+    maxIterations: options.maxIterations || 50,
   };
 
-  const mergedOptions = { ...defaultOptions, ...options };
-
   try {
-    const response = await fetch(`${API_BASE_URL}/chat/completions`, {
+    const response = await fetch(`${API_BASE_URL}/agent/execute`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: mergedOptions.model,
-        messages: [
-          {
-            role: 'system',
-            content: options.systemPrompt || getScaffoldingSystemPrompt()
-          },
-          {
-            role: 'user',
-            content: prompt
-          }
-        ],
-        max_tokens: mergedOptions.max_tokens,
-        temperature: mergedOptions.temperature,
+        message: message,
+        mode: defaultOptions.mode,
+        tools: defaultOptions.tools,
+        workspace: defaultOptions.workspace,
+        max_iterations: defaultOptions.maxIterations,
       }),
     });
 
@@ -56,7 +47,7 @@ async function sendPrompt(prompt, options = {}) {
     }
 
     const data = await response.json();
-    return data.choices[0].message.content;
+    return data;
   } catch (error) {
     console.error('Kilo Code API Error:', error.message);
     throw error;
@@ -64,192 +55,244 @@ async function sendPrompt(prompt, options = {}) {
 }
 
 /**
- * Generate scaffolding code for a new project
+ * Generate scaffolding code for a new project using Kilo Code agent
  * @param {string} projectName - Name of the project to scaffold
  * @param {string} description - Description of what the project should do
- * @returns {Promise<object>} - Object containing files to create
+ * @returns {Promise<object>} - Object containing files created
  */
 async function scaffoldProject(projectName, description) {
-  const prompt = `Create a new project called "${projectName}" with the following description: "${description}"
+  const workspace = process.env.WORKSPACE_DIR || '/workspace';
   
-Please provide the file structure and code for this project. Format your response as a JSON object with the following structure:
-{
-  "files": [
-    {
-      "path": "filename.ext",
-      "content": "file content here"
-    }
-  ]
-}
+  // Validate and sanitize project name
+  const safeProjectName = projectName.replace(/[^a-zA-Z0-9_-]/g, '');
+  
+  const message = `Create a new project called "${safeProjectName}" with the following description: "${description}"
 
-Only include the JSON in your response, no other text.`;
+Please:
+1. First, create the project directory: ${workspace}/${safeProjectName}
+2. Generate all necessary files for a complete, working project
+3. Include a package.json with appropriate dependencies
+4. Write actual working code (not placeholders)
 
-  const response = await sendPrompt(prompt, {
-    systemPrompt: getScaffoldingSystemPrompt()
-  });
-
-  // Parse the JSON response
-  try {
-    // Try to extract JSON from the response (in case there's any surrounding text)
-    const jsonMatch = response.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
-    }
-    return JSON.parse(response);
-  } catch (parseError) {
-    console.error('Failed to parse API response:', parseError);
-    throw new Error('Failed to parse scaffolding response from AI');
-  }
-}
-
-/**
- * System prompt for the scaffolding agent
- */
-function getScaffoldingSystemPrompt() {
-  return `You are an expert software architect specializing in rapid project scaffolding. 
-Your role is to generate clean, production-ready boilerplate code for various project types.
-
-When scaffolding a project:
-1. Choose the appropriate framework and structure based on the description
-2. Include necessary configuration files (package.json, tsconfig.json, etc.)
-3. Write clean, well-commented code
-4. Follow best practices for the specific framework/language
-
-Available project types you should handle:
+Project types I can scaffold:
 - Node.js/Express APIs
-- React/Vue/Angular frontends
+- React/Vue/Angular frontends  
 - Python Flask/Django apps
 - Go services
-- And more
+- Any other framework based on the description
 
-Always respond with valid JSON containing the files array.`;
-}
+Generate the complete file structure and all necessary code files.`;
 
-/**
- * Implement a feature by reading existing context and writing new code
- * @param {string} featureDescription - Description of the feature to implement
- * @param {object} context - Context containing existing file contents
- * @returns {Promise<object>} - Object containing files to create/modify
- */
-async function implementFeature(featureDescription, context = {}) {
-  let contextInfo = '';
-  
-  if (context.files && Array.isArray(context.files)) {
-    contextInfo = '\n\n## Existing Code Context:\n';
-    for (const file of context.files) {
-      contextInfo += `\n### ${file.path}\n\n${file.content}\n`;
-    }
-  }
-  
-  const prompt = `Implement the following feature: "${featureDescription}"${contextInfo}
-
-Please provide the changes needed. Format your response as a JSON object:
-{
-  "files": [
-    {
-      "path": "filename.ext",
-      "content": "file content here",
-      "action": "create|modify|delete"
-    }
-  ],
-  "explanation": "Brief explanation of changes"
-}
-
-Only include the JSON in your response, no other text.`;
-
-  const response = await sendPrompt(prompt, {
-    systemPrompt: getImplementationSystemPrompt()
+  const result = await executeAgent(message, {
+    mode: 'architect',
+    workspace: workspace,
+    tools: ['read_file', 'write_to_file', 'execute_command', 'list_files', 'search_files'],
   });
 
-  try {
-    const jsonMatch = response.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
-    }
-    return JSON.parse(response);
-  } catch (parseError) {
-    console.error('Failed to parse API response:', parseError);
-    throw new Error('Failed to parse implementation response from AI');
-  }
+  return {
+    success: true,
+    projectName: safeProjectName,
+    result: result,
+    message: result.output || 'Project scaffolded successfully',
+  };
 }
 
 /**
- * Review a file and suggest improvements
+ * Implement a feature by using the Kilo Code agent
+ * @param {string} featureDescription - Description of the feature to implement
+ * @param {object} context - Context containing existing information
+ * @returns {Promise<object>} - Result of the implementation
+ */
+async function implementFeature(featureDescription, context = {}) {
+  const workspace = process.env.WORKSPACE_DIR || '/workspace';
+  
+  let contextInfo = '';
+  if (context.files && Array.isArray(context.files)) {
+    contextInfo = '\n\n## Existing files in the workspace:\n';
+    for (const file of context.files) {
+      contextInfo += `- ${file.path}\n`;
+    }
+  }
+
+  const message = `Implement the following feature: "${featureDescription}"${contextInfo}
+
+Please:
+1. First, explore the existing project structure in ${workspace}
+2. Understand the current code patterns and style
+3. Implement the feature following existing conventions
+4. Make minimal, focused changes
+5. If you need to create new files, put them in appropriate locations
+6. If you need to modify existing files, make surgical changes`;
+
+  const result = await executeAgent(message, {
+    mode: 'code',
+    workspace: workspace,
+    tools: ['read_file', 'write_to_file', 'execute_command', 'list_files', 'search_files'],
+  });
+
+  return {
+    success: true,
+    result: result,
+    message: result.output || 'Feature implemented successfully',
+  };
+}
+
+/**
+ * Review a file and suggest improvements using Kilo Code agent
  * @param {string} filePath - Path to the file to review
- * @param {string} fileContent - Content of the file
+ * @param {string} fileContent - Content of the file (optional if agent can read)
  * @returns {Promise<object>} - Review results
  */
 async function reviewFile(filePath, fileContent) {
-  const prompt = `Please review the following file and provide feedback.
+  const workspace = process.env.WORKSPACE_DIR || '/workspace';
+  
+  // If fileContent is provided, use it; otherwise let the agent read the file
+  const contentSection = fileContent 
+    ? `\n\n## File Content:\n\`\`\`\n${fileContent}\n\`\`\``
+    : `\n\nPlease read the file ${filePath} to review its contents.`;
 
-## File: ${filePath}
+  const message = `Please review the following file and provide detailed feedback.
 
-\`\`\`
-${fileContent}
-\`\`\`
+## File: ${filePath}${contentSection}
 
-Provide a detailed review with the following structure as JSON:
-{
-  "summary": "Brief summary of the code",
-  "issues": [
-    {
-      "severity": "high|medium|low",
-      "line": "line number or null",
-      "description": "issue description",
-      "suggestion": "how to fix"
-    }
-  ],
-  "strengths": ["list of good practices"],
-  "recommendations": ["list of recommendations"]
-}
+Please analyze:
+1. Bugs and issues
+2. Security vulnerabilities
+3. Performance problems
+4. Code style violations
+5. Best practice deviations
+6. Areas of strength
 
-Only include the JSON in your response, no other text.`;
+Provide a detailed review with specific line numbers and actionable suggestions for improvement.`;
 
-  const response = await sendPrompt(prompt, {
-    systemPrompt: getReviewSystemPrompt(),
-    max_tokens: 6000
+  const result = await executeAgent(message, {
+    mode: 'ask',
+    workspace: workspace,
+    tools: ['read_file', 'list_files', 'search_files'],
   });
 
-  try {
-    const jsonMatch = response.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
+  // Parse the result to extract review information
+  const output = result?.output || '';
+  
+  // Try to extract structured information from the response
+  return {
+    summary: extractSummary(output),
+    issues: extractIssues(output),
+    strengths: extractStrengths(output),
+    recommendations: extractRecommendations(output),
+    fullReview: output,
+  };
+}
+
+/**
+ * Helper function to extract summary from review output
+ */
+function extractSummary(text) {
+  const lines = text.split('\n');
+  const summaryLines = [];
+  let collecting = false;
+  
+  for (const line of lines) {
+    if (line.toLowerCase().includes('summary') || line.toLowerCase().includes('overview')) {
+      collecting = true;
+      continue;
     }
-    return JSON.parse(response);
-  } catch (parseError) {
-    console.error('Failed to parse API response:', parseError);
-    throw new Error('Failed to parse review response from AI');
+    if (collecting && (line.startsWith('## ') || line.startsWith('### '))) {
+      break;
+    }
+    if (collecting && line.trim()) {
+      summaryLines.push(line.trim());
+    }
   }
+  
+  return summaryLines.length > 0 ? summaryLines.join(' ').substring(0, 500) : 'See full review below';
 }
 
-function getImplementationSystemPrompt() {
-  return `You are an expert software developer specializing in feature implementation.
-Your role is to implement new features by understanding existing code context and adding new functionality.
-
-When implementing features:
-1. Read and understand the existing code context
-2. Follow the existing code style and patterns
-3. Add clean, well-documented code
-4. Handle edge cases and errors appropriately
-5. Write tests if needed`;
+/**
+ * Helper function to extract issues from review output
+ */
+function extractIssues(text) {
+  const issues = [];
+  const lines = text.split('\n');
+  let currentIssue = null;
+  
+  for (const line of lines) {
+    const lowerLine = line.toLowerCase();
+    if (lowerLine.includes('issue') || lowerLine.includes('bug') || lowerLine.includes('problem') || lowerLine.includes('error')) {
+      if (currentIssue) {
+        issues.push(currentIssue);
+      }
+      const severity = lowerLine.includes('critical') || lowerLine.includes('high') ? 'high' 
+        : lowerLine.includes('medium') ? 'medium' 
+        : 'low';
+      currentIssue = {
+        severity: severity,
+        description: line.replace(/^[\s*\-#]+/, '').trim(),
+        suggestion: '',
+      };
+    } else if (currentIssue && (line.trim().startsWith('-') || line.trim().startsWith('→'))) {
+      currentIssue.suggestion += ' ' + line.trim().replace(/^[\s*\-→]+/, '');
+    }
+  }
+  
+  if (currentIssue) {
+    issues.push(currentIssue);
+  }
+  
+  return issues.length > 0 ? issues : [{ severity: 'low', description: 'Review completed - see details below', suggestion: '' }];
 }
 
-function getReviewSystemPrompt() {
-  return `You are an expert code reviewer.
-Your role is to analyze code and provide constructive feedback.
+/**
+ * Helper function to extract strengths from review output
+ */
+function extractStrengths(text) {
+  const strengths = [];
+  const lines = text.split('\n');
+  let collecting = false;
+  
+  for (const line of lines) {
+    if (line.toLowerCase().includes('strength') || line.toLowerCase().includes('good') || line.toLowerCase().includes('well')) {
+      collecting = true;
+      continue;
+    }
+    if (collecting && line.startsWith('## ')) {
+      break;
+    }
+    if (collecting && (line.trim().startsWith('-') || line.trim().startsWith('•'))) {
+      strengths.push(line.replace(/^[\s*\-•]+/, '').trim());
+    }
+  }
+  
+  return strengths;
+}
 
-When reviewing code:
-1. Identify bugs, security issues, and performance problems
-2. Note code style violations and best practice deviations
-3. Highlight good practices and strengths
-4. Provide actionable suggestions for improvement
-5. Be constructive and helpful in your feedback`;
+/**
+ * Helper function to extract recommendations from review output
+ */
+function extractRecommendations(text) {
+  const recommendations = [];
+  const lines = text.split('\n');
+  let collecting = false;
+  
+  for (const line of lines) {
+    if (line.toLowerCase().includes('recommend') || line.toLowerCase().includes('suggestion')) {
+      collecting = true;
+      continue;
+    }
+    if (collecting && line.startsWith('## ') && !line.toLowerCase().includes('recommend')) {
+      break;
+    }
+    if (collecting && (line.trim().startsWith('-') || line.trim().startsWith('•') || line.trim().startsWith('1.'))) {
+      recommendations.push(line.replace(/^[\s*\-•1-9.]+/, '').trim());
+    }
+  }
+  
+  return recommendations;
 }
 
 module.exports = {
-  sendPrompt,
+  executeAgent,
   scaffoldProject,
-  getScaffoldingSystemPrompt,
   implementFeature,
   reviewFile,
 };

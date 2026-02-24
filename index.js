@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 // Workspace directory for file operations
-const WORKSPACE_DIR = '/workspace';
+const WORKSPACE_DIR = process.env.WORKSPACE_DIR || '/workspace';
 
 /**
  * Sanitize a user-provided path to prevent directory traversal attacks
@@ -70,7 +70,7 @@ const app = new App({
 });
 
 // Helper to send status updates to Slack
-async function sendStatusUpdate(channelId, threadTs, message) {
+async function sendStatusUpdate(channelId, threadTs, message, blocks = null) {
   try {
     const { WebClient } = require('@slack/web-api');
     const client = new WebClient(process.env.SLACK_BOT_TOKEN);
@@ -79,10 +79,124 @@ async function sendStatusUpdate(channelId, threadTs, message) {
       channel: channelId,
       thread_ts: threadTs,
       text: message,
+      blocks: blocks,
     });
   } catch (error) {
     console.error('Error sending status update:', error);
   }
+}
+
+/**
+ * Create interactive blocks for approval/rejection actions
+ * @param {string} taskId - Unique identifier for the task
+ * @param {string} taskType - Type of task (scaffold, implement, review)
+ * @param {string} description - Description of the changes
+ * @returns {Array} - Slack Block Kit blocks
+ */
+function createApprovalBlocks(taskId, taskType, description) {
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `*Action Required:* ${taskType === 'scaffold' ? 'Project scaffolding' : taskType === 'implement' ? 'Feature implementation' : 'Code review'} complete!`,
+      },
+    },
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `*Description:* ${description}`,
+      },
+    },
+    {
+      type: 'actions',
+      block_id: `approval_${taskId}`,
+      elements: [
+        {
+          type: 'button',
+          text: {
+            type: 'plain_text',
+            text: '✅ Approve',
+          },
+          style: 'primary',
+          action_id: 'approve_changes',
+          value: taskId,
+        },
+        {
+          type: 'button',
+          text: {
+            type: 'plain_text',
+            text: '🔄 Retry',
+          },
+          style: 'danger',
+          action_id: 'retry_changes',
+          value: taskId,
+        },
+        {
+          type: 'button',
+          text: {
+            type: 'plain_text',
+            text: '📝 View Details',
+          },
+          action_id: 'view_details',
+          value: taskId,
+        },
+      ],
+    },
+  ];
+}
+
+/**
+ * Create confirmation blocks after approval
+ * @param {string} taskId - Task ID
+ * @returns {Array} - Slack Block Kit blocks
+ */
+function createApprovalConfirmationBlocks(taskId) {
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: '✅ *Changes Approved!* The files have been applied to your workspace.',
+      },
+    },
+    {
+      type: 'context',
+      elements: [
+        {
+          type: 'mrkdwn',
+          text: `Task ID: ${taskId}`,
+        },
+      ],
+    },
+  ];
+}
+
+/**
+ * Create retry confirmation blocks
+ * @param {string} taskId - Task ID
+ * @returns {Array} - Slack Block Kit blocks
+ */
+function createRetryConfirmationBlocks(taskId) {
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: '🔄 *Retrying task...* Please wait while the agent processes your request again.',
+      },
+    },
+    {
+      type: 'context',
+      elements: [
+        {
+          type: 'mrkdwn',
+          text: `Task ID: ${taskId}`,
+        },
+      ],
+    },
+  ];
 }
 
 // Listen for the /kilo slash command
@@ -154,26 +268,56 @@ app.command('/kilo', async ({ command, ack, respond }) => {
         
         const result = await scaffoldProject(safeProjectName, description);
         
-        if (result.files && Array.isArray(result.files)) {
-          let createdFiles = [];
-          for (const file of result.files) {
-            // Sanitize the file path from AI response
+        // The new Kilo Code agent returns results differently
+        // Check for files created in the response
+        let createdFiles = [];
+        
+        if (result.result?.files && Array.isArray(result.result.files)) {
+          // Files returned directly in result
+          for (const file of result.result.files) {
             const filePath = sanitizePath(path.join(safeProjectName, file.path));
             const dirPath = path.dirname(filePath);
             
-            // Create directory if it doesn't exist
             if (!fs.existsSync(dirPath)) {
               fs.mkdirSync(dirPath, { recursive: true });
             }
             
-            // Write the file
             fs.writeFileSync(filePath, file.content, { encoding: 'utf8' });
             createdFiles.push(file.path);
           }
-          
-          await respond(`✅ Successfully scaffolded \`${safeProjectName}\` with ${createdFiles.length} files:\n${createdFiles.map(f => `• \`${f}\``).join('\n')}`);
+        } else if (result.result?.tool_calls) {
+          // Check for write_to_file tool calls in the agent result
+          const writeCalls = result.result.tool_calls.filter(tc => tc.tool === 'write_to_file');
+          for (const call of writeCalls) {
+            const filePath = sanitizePath(call.path);
+            const dirPath = path.dirname(filePath);
+            
+            if (!fs.existsSync(dirPath)) {
+              fs.mkdirSync(dirPath, { recursive: true });
+            }
+            
+            fs.writeFileSync(filePath, call.content || '', { encoding: 'utf8' });
+            createdFiles.push(call.path);
+          }
+        }
+        
+        const responseMsg = result.message || result.result?.output || 'Project scaffolded successfully';
+        
+        // Generate a unique task ID for this operation
+        const taskId = `scaffold_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        
+        if (createdFiles.length > 0) {
+          const blocks = createApprovalBlocks(taskId, 'scaffold', `Scaffolded project \`${safeProjectName}\` with ${createdFiles.length} files`);
+          await respond({
+            text: `✅ Successfully scaffolded \`${safeProjectName}\` with ${createdFiles.length} files:\n${createdFiles.map(f => `• \`${f}\``).join('\n')}\n\n📝 ${responseMsg}`,
+            blocks: blocks,
+          });
         } else {
-          await respond(`⚠️ No files were generated for \`${safeProjectName}\``);
+          const blocks = createApprovalBlocks(taskId, 'scaffold', `Scaffolded project \`${safeProjectName}\``);
+          await respond({
+            text: `✅ Project \`${safeProjectName}\` scaffolded!\n\n📝 ${responseMsg}`,
+            blocks: blocks,
+          });
         }
       } catch (error) {
         await respond(`❌ Error scaffolding project: ${error.message}`);
@@ -214,10 +358,12 @@ app.command('/kilo', async ({ command, ack, respond }) => {
       
       const result = await implementFeature(featureDescription, context);
       
-      if (result.files && Array.isArray(result.files)) {
-        let changedFiles = [];
-        for (const file of result.files) {
-          // Sanitize the file path from AI response
+      // Handle the new Kilo Code agent response format
+      let changedFiles = [];
+      
+      if (result.result?.files && Array.isArray(result.result.files)) {
+        // Files returned directly in result
+        for (const file of result.result.files) {
           const filePath = sanitizePath(file.path);
           const dirPath = path.dirname(filePath);
           
@@ -235,11 +381,39 @@ app.command('/kilo', async ({ command, ack, respond }) => {
             changedFiles.push(file.action === 'create' ? `➕ \`${file.path}\`` : `✏️ \`${file.path}\``);
           }
         }
-        
-        const explanation = result.explanation ? `\n\n📝 ${result.explanation}` : '';
-        await respond(`✅ Implemented feature with ${changedFiles.length} file changes:${explanation}\n${changedFiles.join('\n')}`);
+      } else if (result.result?.tool_calls) {
+        // Check for write_to_file tool calls in the agent result
+        const writeCalls = result.result.tool_calls.filter(tc => tc.tool === 'write_to_file');
+        for (const call of writeCalls) {
+          const filePath = sanitizePath(call.path);
+          const dirPath = path.dirname(filePath);
+          
+          if (!fs.existsSync(dirPath)) {
+            fs.mkdirSync(dirPath, { recursive: true });
+          }
+          
+          fs.writeFileSync(filePath, call.content || '', { encoding: 'utf8' });
+          changedFiles.push(`✏️ \`${call.path}\``);
+        }
+      }
+      
+      const explanation = result.message || result.result?.output || '';
+      
+      // Generate a unique task ID for this operation
+      const taskId = `implement_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      
+      if (changedFiles.length > 0) {
+        const blocks = createApprovalBlocks(taskId, 'implement', `Implemented feature: "${featureDescription}" with ${changedFiles.length} file changes`);
+        await respond({
+          text: `✅ Implemented feature with ${changedFiles.length} file changes:\n${changedFiles.join('\n')}${explanation ? `\n\n📝 ${explanation}` : ''}`,
+          blocks: blocks,
+        });
       } else {
-        await respond(`⚠️ No changes were made.`);
+        const blocks = createApprovalBlocks(taskId, 'implement', `Implemented feature: "${featureDescription}"`);
+        await respond({
+          text: `✅ Feature implementation complete!\n\n📝 ${explanation || 'The agent has processed your request.'}`,
+          blocks: blocks,
+        });
       }
     } catch (error) {
       await respond(`❌ Error implementing feature: ${error.message}`);
@@ -292,12 +466,126 @@ app.command('/kilo', async ({ command, ack, respond }) => {
         responseMessage += `*Recommendations:*\n${result.recommendations.map(r => `• ${r}`).join('\n')}`;
       }
       
-      await respond(responseMessage);
+      // Generate a unique task ID for this review
+      const taskId = `review_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      
+      // Add approval blocks
+      const blocks = createApprovalBlocks(taskId, 'review', `Code review for \`${filePath}\``);
+      
+      await respond({
+        text: responseMessage,
+        blocks: blocks,
+      });
     } catch (error) {
       await respond(`❌ Error reviewing file: ${error.message}`);
     }
   } else {
     await respond(`I received the command: \`/kilo ${command.text}\`, but I don't know how to handle the action "${action}" yet.`);
+  }
+});
+
+// Interactive button action listeners
+app.action('approve_changes', async ({ ack, body, respond }) => {
+  await ack();
+  
+  const taskId = body.actions[0].value;
+  const userId = body.user.id;
+  const channelId = body.container.channel_id;
+  
+  console.log(`User ${userId} approved task ${taskId}`);
+  
+  // Send confirmation with blocks
+  await respond({
+    response_type: 'in_channel',
+    text: '✅ Changes Approved!',
+    blocks: createApprovalConfirmationBlocks(taskId),
+  });
+});
+
+app.action('retry_changes', async ({ ack, body, respond }) => {
+  await ack();
+  
+  const taskId = body.actions[0].value;
+  const userId = body.user.id;
+  const channelId = body.container.channel_id;
+  
+  console.log(`User ${userId} requested retry for task ${taskId}`);
+  
+  // Send retry confirmation with blocks
+  await respond({
+    response_type: 'in_channel',
+    text: '🔄 Retrying task...',
+    blocks: createRetryConfirmationBlocks(taskId),
+  });
+  
+  // If task queue is available, re-queue the task
+  if (taskQueue) {
+    try {
+      // Get the original task and re-queue it
+      const status = await taskQueue.getTaskStatus(taskId);
+      if (status) {
+        const newTaskId = await taskQueue.enqueueTask({
+          type: status.type,
+          projectName: status.projectName,
+          description: status.description,
+          channelId: channelId,
+          userId: userId,
+          retryOf: taskId,
+        });
+        
+        await sendStatusUpdate(channelId, null, `🔄 Task re-queued as Task ID: ${newTaskId}`);
+        startWorker();
+      }
+    } catch (error) {
+      console.error('Error re-queuing task:', error);
+      await sendStatusUpdate(channelId, null, `❌ Error re-queuing task: ${error.message}`);
+    }
+  }
+});
+
+app.action('view_details', async ({ ack, body, respond }) => {
+  await ack();
+  
+  const taskId = body.actions[0].value;
+  const channelId = body.container.channel_id;
+  
+  console.log(`User requested details for task ${taskId}`);
+  
+  // If task queue is available, get task details
+  if (taskQueue) {
+    try {
+      const status = await taskQueue.getTaskStatus(taskId);
+      if (status) {
+        let details = `*Task Details (${taskId})*\n`;
+        details += `• Type: ${status.type}\n`;
+        details += `• Status: ${status.status}\n`;
+        details += `• Created: ${status.createdAt}\n`;
+        
+        if (status.result?.files) {
+          details += `\n*Files:*\n${status.result.files.map(f => `• \`${f}\``).join('\n')}`;
+        }
+        
+        await respond({
+          response_type: 'in_channel',
+          text: details,
+        });
+      } else {
+        await respond({
+          response_type: 'in_channel',
+          text: `❌ Task not found: ${taskId}`,
+        });
+      }
+    } catch (error) {
+      await respond({
+        response_type: 'in_channel',
+        text: `❌ Error getting task details: ${error.message}`,
+      });
+    }
+  } else {
+    await respond({
+      response_type: 'in_channel',
+      text: `📋 Task ID: ${taskId}\nTask queue not available for detailed view.`,
+    });
   }
 });
 
@@ -318,10 +606,11 @@ async function startWorker() {
         // Process the scaffold request
         const result = await scaffoldProject(task.projectName, task.description);
         
-        if (result.files && Array.isArray(result.files)) {
-          let createdFiles = [];
-          for (const file of result.files) {
-            // Sanitize the file path from AI response
+        // Handle the new Kilo Code agent response format
+        let createdFiles = [];
+        
+        if (result.result?.files && Array.isArray(result.result.files)) {
+          for (const file of result.result.files) {
             const filePath = sanitizePath(path.join(task.projectName, file.path));
             const dirPath = path.dirname(filePath);
             
@@ -332,14 +621,43 @@ async function startWorker() {
             fs.writeFileSync(filePath, file.content, { encoding: 'utf8' });
             createdFiles.push(file.path);
           }
-          
+        } else if (result.result?.tool_calls) {
+          const writeCalls = result.result.tool_calls.filter(tc => tc.tool === 'write_to_file');
+          for (const call of writeCalls) {
+            const filePath = sanitizePath(call.path);
+            const dirPath = path.dirname(filePath);
+            
+            if (!fs.existsSync(dirPath)) {
+              fs.mkdirSync(dirPath, { recursive: true });
+            }
+            
+            fs.writeFileSync(filePath, call.content || '', { encoding: 'utf8' });
+            createdFiles.push(call.path);
+          }
+        }
+        
+        const responseMsg = result.message || result.result?.output || 'Project scaffolded successfully';
+        
+        const taskId = task.id;
+        
+        if (createdFiles.length > 0) {
+          const blocks = createApprovalBlocks(taskId, 'scaffold', `Scaffolded project \`${task.projectName}\` with ${createdFiles.length} files`);
           await sendStatusUpdate(
             task.channelId, 
             null, 
-            `✅ Successfully scaffolded \`${task.projectName}\` with ${createdFiles.length} files:\n${createdFiles.map(f => `• \`${f}\``).join('\n')}`
+            `✅ Successfully scaffolded \`${task.projectName}\` with ${createdFiles.length} files:\n${createdFiles.map(f => `• \`${f}\``).join('\n')}\n\n📝 ${responseMsg}`,
+            blocks
           );
-          
           await taskQueue.updateTaskStatus(task.id, 'completed', { files: createdFiles });
+        } else {
+          const blocks = createApprovalBlocks(taskId, 'scaffold', `Scaffolded project \`${task.projectName}\``);
+          await sendStatusUpdate(
+            task.channelId, 
+            null, 
+            `✅ Project \`${task.projectName}\` scaffolded!\n\n📝 ${responseMsg}`,
+            blocks
+          );
+          await taskQueue.updateTaskStatus(task.id, 'completed', {});
         }
       }
     } catch (error) {
