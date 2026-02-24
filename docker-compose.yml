@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  orchestrator:
+    build: .
+    container_name: slack-commander
+    environment:
+      - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
+      - KILOCODE_API_KEY=${KILOCODE_API_KEY}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      # Mount the local projects directory to /workspace in the container
+      # This allows the orchestrator to create/modify files on the host machine
+      - ~/projects:/workspace
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: slack-commander-redis
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  redis-data:
